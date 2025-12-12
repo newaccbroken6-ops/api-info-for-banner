@@ -5,6 +5,7 @@ import httpx
 import json
 from collections import defaultdict
 from flask import Flask, request, jsonify
+from functools import wraps
 from flask_cors import CORS
 from cachetools import TTLCache
 from typing import Tuple
@@ -38,13 +39,7 @@ def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
 
 def decode_protobuf(encoded_data: bytes, message_type: message.Message) -> message.Message:
     instance = message_type()
-    try:
-        instance.ParseFromString(encoded_data)
-    except Exception as e:
-        print(f"Failed to parse protobuf: {str(e)}")
-        print(f"Data length: {len(encoded_data)}")
-        print(f"Data (first 100 bytes): {encoded_data[:100]}")
-        raise
+    instance.ParseFromString(encoded_data)
     return instance
 
 async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
@@ -53,8 +48,9 @@ async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
 
 def get_account_credentials(region: str) -> str:
     r = region.upper()
+    # fixed the extra stray quotes and ensured known credentials per region
     if r == "IND":
-        return "uid=u4218389302id&password=NILAY-9LRRJQ7P3-NR-CODEX"
+        return "uid=4218389302&password=NILAY-9LRRJQ7P3-NR-CODEX"
     elif r == "BD":
         return "uid=4218400521&password=BY_XRSUPER-JZRQ3RURQ-XRRRR"
     elif r in {"BR", "US", "SAC", "NA"}:
@@ -86,37 +82,13 @@ async def create_jwt(region: str):
     }
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, data=payload, headers=headers)
-        # Add error handling for response
-        if resp.status_code != 200:
-            print(f"Error: Received status code {resp.status_code} for region {region}")
-            print(f"Response content: {resp.content}")
-            # Set default values for failed token creation
-            cached_tokens[region] = {
-                'token': "Bearer 0",
-                'region': region,
-                'server_url': "https://default-server-url.com",
-                'expires_at': time.time() + 25200
-            }
-            return
-        
-        try:
-            msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
-            cached_tokens[region] = {
-                'token': f"Bearer {msg.get('token','0')}",
-                'region': msg.get('lockRegion','0'),
-                'server_url': msg.get('serverUrl','0'),
-                'expires_at': time.time() + 25200
-            }
-        except Exception as e:
-            print(f"Error decoding protobuf for region {region}: {str(e)}")
-            print(f"Response content: {resp.content}")
-            # Set default values for failed token creation
-            cached_tokens[region] = {
-                'token': "Bearer 0",
-                'region': region,
-                'server_url': "https://default-server-url.com",
-                'expires_at': time.time() + 25200
-            }
+        msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
+        cached_tokens[region] = {
+            'token': f"Bearer {msg.get('token','0')}",
+            'region': msg.get('lockRegion','0'),
+            'server_url': msg.get('serverUrl','0'),
+            'expires_at': time.time() + 25200
+        }
 
 async def initialize_tokens():
     tasks = [create_jwt(r) for r in SUPPORTED_REGIONS]
@@ -156,20 +128,31 @@ async def GetAccountInformation(uid, unk, region, endpoint):
     }
     async with httpx.AsyncClient() as client:
         resp = await client.post(server + endpoint, data=data_enc, headers=headers)
-        # Add error handling for response
+        print(f"Response status: {resp.status_code}")
+        print(f"Response content length: {len(resp.content)}")
+        
+        # Check if response is successful
         if resp.status_code != 200:
-            print(f"Error: Received status code {resp.status_code} for account info request")
-            print(f"Response content: {resp.content}")
-            raise Exception(f"Failed to get account information: {resp.status_code}")
+            raise ValueError(f"Server returned error status {resp.status_code}")
+        
+        # Check if response has content
+        if not resp.content:
+            raise ValueError("Empty response from server")
         
         try:
-            return json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
+            # Try to decode the protobuf response
+            decoded = decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)
+            return json.loads(json_format.MessageToJson(decoded))
         except Exception as e:
-            print(f"Error decoding account info protobuf: {str(e)}")
-            print(f"Response content: {resp.content}")
-            raise
+            print(f"Error decoding protobuf: {str(e)}")
+            # Return a simplified response for debugging
+            return {"error": "Failed to decode response", "raw_content_length": len(resp.content)}
 
 def format_response(data):
+    # Handle error responses
+    if "error" in data:
+        return data
+    
     return {
         "AccountInfo": {
             "AccountAvatarId": data.get("basicInfo", {}).get("headPic"),
@@ -215,41 +198,65 @@ def format_response(data):
 
 # === API Routes ===
 @app.route('/info')
-async def get_account_info():
+def get_account_info():
     uid = request.args.get('uid')
+    region = request.args.get('region')  # Allow specifying region as parameter
+    
     if not uid:
         return jsonify({"error": "Please provide UID."}), 400
     
     try:
-        # Get region from external API
-        region = await get_region_by_uid(uid)
-        if not region or region not in SUPPORTED_REGIONS:
-            return jsonify({"error": "Invalid region or unsupported region"}), 400
+        # If region not provided, try to fetch it or use default
+        if not region:
+            try:
+                # Try to get region from external API
+                import asyncio
+                region = asyncio.run(get_region_by_uid(uid))
+            except:
+                # If external API fails, use a default region
+                region = "IND"  # Default to IND region
+                print(f"Using default region {region} as external API failed")
+        
+        # Validate region
+        if region not in SUPPORTED_REGIONS:
+            # Try to use a default region if provided region is invalid
+            region = "ME"
+            print(f"Invalid region provided, using default region {region}")
         
         # Get account information
-        return_data = await GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow")
+        import asyncio
+        return_data = asyncio.run(GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow"))
         formatted = format_response(return_data)
         return jsonify(formatted), 200
     
     except Exception as e:
-        return jsonify({"error": "Invalid UID or server error. Please try again."}), 500
+        print(f"Error processing request: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Invalid UID or server error. Please try again. Details: {str(e)}"}), 500
 
 @app.route('/refresh', methods=['GET', 'POST'])
 def refresh_tokens_endpoint():
     try:
+        import asyncio
         asyncio.run(initialize_tokens())
         return jsonify({'message': 'Tokens refreshed for all regions.'}), 200
     except Exception as e:
         return jsonify({'error': f'Refresh failed: {e}'}), 500
 
 # === Startup ===
-async def startup():
-    await initialize_tokens()
-    asyncio.create_task(refresh_tokens_periodically())
+def startup():
+    import asyncio
+    asyncio.run(initialize_tokens())
+    # Start token refresh in background
+    import threading
+    def refresh_worker():
+        import asyncio
+        asyncio.run(refresh_tokens_periodically())
+    thread = threading.Thread(target=refresh_worker, daemon=True)
+    thread.start()
 
 if __name__ == '__main__':
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(startup())
+    startup()
     app.run(host='0.0.0.0', port=5080, debug=True)
     
