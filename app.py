@@ -138,7 +138,7 @@ async def get_token_info(region: str) -> Tuple[str, str, str]:
 async def get_region_by_uid(uid: str) -> str:
     """Fetch player region using external API"""
     async with httpx.AsyncClient() as client:
-        resp = await client.get(f"https://api-info-v1.onrender.com/check?uid={uid}")
+        resp = await client.get(f"https://your-region-api.vercel.app/region?uid={uid}")
         if resp.status_code != 200:
             raise ValueError("Failed to fetch region")
         data = resp.json()
